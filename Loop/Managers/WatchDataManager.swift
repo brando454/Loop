@@ -231,7 +231,8 @@ final class WatchDataManager: NSObject {
         }
     }
 
-    private func createWatchContext(recommendingBolusFor potentialCarbEntry: NewCarbEntry? = nil, _ completion: @escaping (_ context: WatchContext) -> Void) {
+    // Internal so PixelWatchDataManager can stream the identical context payload
+    func createWatchContext(recommendingBolusFor potentialCarbEntry: NewCarbEntry? = nil, _ completion: @escaping (_ context: WatchContext) -> Void) {
         var dosingDecision = BolusDosingDecision(for: .watchBolus)
 
         let loopManager = deviceManager.loopManager!

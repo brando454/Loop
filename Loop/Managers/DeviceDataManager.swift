@@ -233,6 +233,8 @@ final class DeviceDataManager {
 
     private var watchManager: WatchDataManager!
 
+    private var pixelWatchManager: PixelWatchDataManager!
+
     // MARK: - Status Extension
 
     private var statusExtensionManager: ExtensionDataManager!
@@ -406,6 +408,8 @@ final class DeviceDataManager {
         loopManager.presetActivationObservers.append(analyticsServicesManager)
 
         watchManager = WatchDataManager(deviceManager: self, healthStore: healthStore)
+
+        pixelWatchManager = PixelWatchDataManager(deviceManager: self, watchManager: watchManager)
 
         let remoteDataServicesManager = RemoteDataServicesManager(
             alertStore: alertManager.alertStore,

@@ -37,8 +37,8 @@ class PixelWatchActionsSnapshotTests: XCTestCase {
         XCTAssertEqual(actions["v"] as? Int, PixelWatchActionsSnapshot.actionsSchemaVersion)
         let cap = try XCTUnwrap(actions["cap"] as? [String: Bool])
         XCTAssertEqual(cap, [
-            "preMeal": false,
-            "workout": false,
+            "preMeal": true,
+            "workout": true,
             "carbs": false,
             "bolus": false
         ])
@@ -308,9 +308,10 @@ class PixelWatchActionsSnapshotTests: XCTestCase {
         XCTAssertEqual(full.chunks.last?.first.map { $0 & 0x02 }, UInt8(0x02))
         let fullAct = try XCTUnwrap(try plist(from: full)["act"] as? [String: Any])
         let cap = try XCTUnwrap(fullAct["cap"] as? [String: Any])
-        for key in ["preMeal", "workout", "carbs", "bolus"] {
-            XCTAssertEqual(boolValue(cap[key]), false, key)
-        }
+        XCTAssertEqual(boolValue(cap["preMeal"]), true)
+        XCTAssertEqual(boolValue(cap["workout"]), true)
+        XCTAssertEqual(boolValue(cap["carbs"]), false)
+        XCTAssertEqual(boolValue(cap["bolus"]), false)
     }
 
     func testNotificationFramingFlagsAndSequence() {
@@ -333,9 +334,9 @@ class PixelWatchActionsSnapshotTests: XCTestCase {
         XCTAssertEqual(PixelWatchDataManager.contextProperties, [.notifyEncryptionRequired])
         XCTAssertTrue(PixelWatchDataManager.contextProperties.intersection(writable).isEmpty)
         XCTAssertEqual(PixelWatchDataManager.contextPermissions, [])
-        XCTAssertFalse(PixelWatchDataManager.contextPermissions.contains(.write))
+        XCTAssertFalse(PixelWatchDataManager.contextPermissions.contains(.writeable))
         XCTAssertFalse(PixelWatchDataManager.contextPermissions.contains(.writeEncryptionRequired))
-        XCTAssertFalse(PixelWatchDataManager.contextPermissions.contains(.read))
+        XCTAssertFalse(PixelWatchDataManager.contextPermissions.contains(.readable))
     }
 
     private func sampleContext(recommendedBolus: Double?) -> WatchContext {

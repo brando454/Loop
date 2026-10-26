@@ -1,20 +1,33 @@
 # Pixel Watch status protocol
 
-Read-only snapshot Loop publishes to a bonded Wear OS watch (Loop Wrist). The phone is the only dosing authority. This document is the contract for the watch parser. It describes the notify payload after the actions snapshot was added. It does not describe a command channel: this build has no write characteristic and does not enact boluses, carbs, or overrides.
+Status snapshot and override commands Loop exchanges with a bonded Wear OS watch (Loop Wrist). The phone is the only dosing authority. This document is the contract for the watch. The notify payload is the actions snapshot. The write payload is a Pre-Meal or named-preset override command. This build does not accept carb or bolus commands.
 
 ## Transport
 
-Unchanged from the first Pixel Watch build.
+One service. Two characteristics. Link encryption is the existing iPhone bond (the same bond the notify path already required). There is no second app-level key.
 
-| | |
-|---|---|
-| Service | `354E12EF-6EA4-4255-B054-9D2A113E2C8D` |
-| Characteristic | `219E7627-1F0C-4D0C-951F-FDC44514B868` |
-| Properties | Notify, encryption required |
-| Permissions | None. The value is not readable and not writable. |
-| Direction | Phone to watch only |
+| | Context | Command |
+|---|---|---|
+| Service | `354E12EF-6EA4-4255-B054-9D2A113E2C8D` | same service |
+| Characteristic | `219E7627-1F0C-4D0C-951F-FDC44514B868` | `C5D8A1E4-7B32-4F9A-8E16-0A4D5C7B9E21` |
+| Properties | Notify, encryption required | Write, write encryption required |
+| Permissions | None. Not readable and not writable. | Write encryption required only. There is no unencrypted write permission. |
+| Direction | Phone to watch | Watch to phone |
 
-A peer that is not bonded cannot subscribe. No characteristic on this service accepts writes.
+A peer that is not bonded cannot subscribe and cannot write. Core Bluetooth rejects an unencrypted write before Loop sees the bytes.
+
+The command characteristic is new. After this build is installed, the watch has to disconnect and reconnect once so it discovers the write characteristic. A restored GATT service from the previous build had notify only; Loop drops that service and publishes both characteristics.
+
+Writes are Write With Response. There is no write-without-response. Do not put the notify framing bytes on the write. One command is one binary property list. If it is larger than the ATT MTU, the watch uses a normal BLE long write (prepare/execute). Loop reassembles the parts by offset. The command must be at most 2048 bytes, must start at offset 0, and must not have gaps or empty parts.
+
+| Write problem | ATT result | Ack |
+|---|---|---|
+| Not the command characteristic | Write Not Permitted | none |
+| Offset gap, or the first byte is not at offset 0 | Invalid Offset | none |
+| Empty value, or more than 2048 bytes | Invalid Attribute Value Length | none |
+| Bytes accepted | Success | a notify ack, then a snapshot |
+
+ATT success means Loop accepted the bytes. It does not mean the override changed. The ack is the result. Loop does not retry a command, and the watch must not retry a command by writing the same `requestId` again in order to apply it a second time. Writing that same id again within 24 hours only repeats the original ack.
 
 ### Framing
 
@@ -26,19 +39,20 @@ Each notification is:
 | 1 | 1 | Sequence number within the message, starting at 0, wrapping as `UInt8`. |
 | 2 | rest | Payload bytes |
 
-The watch resets reassembly when it sees the first-chunk flag, appends payloads in sequence order, and parses when it sees the last-chunk flag. A gap in the sequence drops the message. A newer message may replace one that has not finished; the next first-chunk flag starts over.
+The watch resets reassembly when it sees the first-chunk flag, appends payloads in sequence order, and parses when it sees the last-chunk flag. A gap in the sequence drops the message. A newer message may replace one that has not finished; the next first-chunk flag starts over. That new message may be an ack or a snapshot. Tell them apart by the top-level key: `ack` is a command result, `ctx` is a snapshot.
 
 The sequence byte gives a message at most 256 chunks. Chunk size is `max(18, maximumUpdateValueLength - 2)` bytes of payload. On a negotiated ATT MTU this is plenty. On a 20-byte link the budget is about 4.5 KB. If the full snapshot would exceed 256 chunks, the phone sends the same envelope without the preset list (`presetsTruncated` true, `presets` omitted). If that still does not fit, it sends the original envelope (`v`, `ctx`, `hg` only) and leaves `act` out. The watch treats a missing `act` as "no actions metadata" (every capability false), not as an empty preset list.
 
 ## Versioning
 
-Three version numbers travel together. They are not interchangeable.
+These version numbers are not interchangeable.
 
 | Field | Current | What it versions |
 |---|---|---|
-| Envelope `v` | `1` | `ctx` and `hg`. Left at 1 so a watch that already reads those keys keeps working. |
+| Envelope `v` | `1` | `ctx` and `hg` on a snapshot. The same `1` is the top-level version of an ack message. Left at 1 so a watch that already reads `ctx` and `hg` keeps working. |
 | `ctx.v` | `5` | `WatchContext`, shared with the Apple Watch. This payload does not change it. |
 | `act.v` | `1` | The actions snapshot described below. |
+| Command `v` | `1` | The write plist. Independent of `act.v`. |
 
 Rules for the watch:
 
@@ -51,7 +65,7 @@ Bump `act.v` when an existing actions field changes meaning. Adding a key does n
 
 ## Envelope
 
-Binary property list. Top-level dictionary:
+Snapshot messages are a binary property list. An ack is a different plist and does not include `ctx`. Top-level dictionary:
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
@@ -89,7 +103,7 @@ Binary property list. Top-level dictionary:
 | Key | Type | Required | Meaning |
 |---|---|---|---|
 | `v` | Int | yes | Actions schema version. `1`. |
-| `cap` | Dictionary | yes | Which commands this phone will accept. All `false` in this build. |
+| `cap` | Dictionary | yes | Which commands this phone will accept. |
 | `presets` | Array of dictionaries | no | Override presets, Loop's list order, at most 16. Omitted when dropped for size. |
 | `presetsTruncated` | Bool | yes | `true` when `presets` is not the full list (capped, or omitted for size). |
 | `override` | Dictionary | no | Unfinished schedule override. Omitted when none is running or scheduled. |
@@ -101,14 +115,14 @@ Binary property list. Top-level dictionary:
 
 ### `cap`
 
-| Key | Type | This build | Command it will gate later |
+| Key | Type | This build | Command |
 |---|---|---|---|
-| `preMeal` | Bool | `false` | Turn Pre-Meal on or off. |
-| `workout` | Bool | `false` | Start a named preset, or cancel the schedule override. |
-| `carbs` | Bool | `false` | Store a carb entry. |
-| `bolus` | Bool | `false` | Enact a bolus. |
+| `preMeal` | Bool | `true` | `preMeal.start` and `preMeal.stop`. |
+| `workout` | Bool | `true` | `preset.start` and `preset.stop`. |
+| `carbs` | Bool | `false` | Store a carb entry. Still refused. |
+| `bolus` | Bool | `false` | Enact a bolus. Still refused. |
 
-`false`, or a missing key, means the phone does not accept that command. This build publishes no write characteristic, so the watch must not write one. A later build that accepts a command has to set that boolean to `true` in the same release that accepts the write.
+`false`, or a missing key, means the phone does not accept that command. The watch writes a command only when the matching capability in the latest snapshot is `true`. `cap` stays `true` while no-dose test mode is on; the ack reason `testMode` is what says the phone did not change settings.
 
 ### `presets[]`
 
@@ -218,7 +232,7 @@ Logical contents. On the wire this is a binary property list: dates are plist da
   "hg": [[1761447480, 110], [1761447780, 118]],
   "act": {
     "v": 1,
-    "cap": { "preMeal": false, "workout": false, "carbs": false, "bolus": false },
+    "cap": { "preMeal": true, "workout": true, "carbs": false, "bolus": false },
     "presets": [
       {
         "id": "2F1C0A7E-6B4D-4E2A-9C11-8A0B1C2D3E4F",
@@ -272,9 +286,122 @@ Logical contents. On the wire this is a binary property list: dates are plist da
 }
 ```
 
+## Commands
+
+The watch writes a binary property list to the command characteristic. Dates are plist dates. Integers are integers. Do not send a glucose target, a symbol, or an insulin-needs factor. Those keys are rejected so a watch cannot believe it set a range Loop did not store.
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `v` | Int | yes | Command schema version. `1`. A missing `v` is `malformed`. Any other value is `unsupportedVersion`. |
+| `cmd` | String | yes | One of the names below. |
+| `requestId` | String | yes | UUID, `UUID.uuidString`. Case-insensitive. The dedupe key. |
+| `timestamp` | Date | yes | When the watch created the command. Plist date. Freshness only. Not the override start. |
+| `presetId` | String | `preset.start` only | UUID of a preset in the latest `act.presets` list. |
+| `durationSeconds` | Double | no | Used only on `preMeal.start` and `preset.start`. Ignored on stop. |
+
+| `cmd` | Effect |
+|---|---|
+| `preMeal.start` | Turn on Pre-Meal using the target stored in Loop settings. Duration is `durationSeconds` when present, otherwise 1 hour. |
+| `preMeal.stop` | Clear Pre-Meal only. Ok when Pre-Meal is already off. Does not clear a workout preset. |
+| `preset.start` | Start that named preset with `TemporaryScheduleOverridePreset.createOverride(enactTrigger: .local)`. Duration is `durationSeconds` when present, otherwise the duration stored on the preset, including indefinite. |
+| `preset.stop` | Clear the schedule override only (`clearOverride()`). `presetId` is ignored. Ok when nothing is running. Does not clear Pre-Meal. |
+
+Pre-Meal and a schedule override may both be active. Loop keeps using the pre-meal target until the pre-meal override's scheduled end. Starting one does not cancel the other.
+
+The override's start date is the phone's clock at the moment Loop applies the command. `timestamp` is not copied onto the override.
+
+`durationSeconds` must be finite and greater than 0, and at most `act.limits.maxOverrideDurationSeconds` (24 hours). `0` is invalid. It does not mean indefinite. Indefinite is only available by omitting `durationSeconds` on `preset.start` when that preset is stored as indefinite. A stored finite duration longer than 24 hours is rejected instead of started. This is the same cap as `LoopConstants.maxOverrideDurationTime`. The phone status screen's APIs are the ones that run: `enablePreMealOverride(at:for:)`, `clearOverride(matching: .preMeal)`, `createOverride(enactTrigger: .local)`, and `clearOverride()`.
+
+These names are recognized and rejected with `unsupported`. They do not change settings: `carbs`, `carbs.entry`, `carbs.start`, `bolus`, `bolus.enact`, `bolus.start`, `recommend`. Any other string is `unknownCommand`.
+
+### Freshness and duplicates
+
+Loop rejects a command when `timestamp` is more than 2 minutes older than the phone clock (`stale`), or more than 5 seconds ahead of it (`future`). A timestamp exactly 2 minutes old, or exactly 5 seconds ahead, is accepted. The 5 seconds is clock skew so a watch that runs slightly fast still works.
+
+`requestId` is remembered for 24 hours, including across a relaunch. The window starts at the first time that id is processed and is not extended when the same id is written again. A duplicate returns the original ack and does not change settings. A command without a parseable `requestId` is `malformed` and is not remembered.
+
+### Ack
+
+Loop notifies the ack on the context characteristic, using the same chunk framing as a snapshot. The ack is its own plist. It is not a key inside the snapshot. A message with `ack` is a result. A message with `ctx` is a snapshot. After the ack has been queued, Loop pushes a fresh snapshot so the watch can read the new override state. Trust the snapshot for what is running. Trust the ack for what happened to this `requestId`.
+
+If no watch is subscribed, the command is still processed and the ack is logged as not sent. Loop does not retry it later. The next subscribe sends a snapshot only.
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `v` | Int | yes | Envelope version. `1`, same number as a snapshot envelope. |
+| `ack` | Dictionary | yes | The result. |
+| `ack.requestId` | String | when the write contained one | The command's `requestId`. Omitted when the body was not a dictionary or had no UUID. |
+| `ack.status` | String | yes | `ok`, `rejected`, or `error`. |
+| `ack.reason` | String | on `rejected` and `error`, and on test-mode `ok` | See the table below. Omitted on a normal `ok`. |
+
+`rejected` means Loop did not change settings. `error` means the command passed validation and then could not be applied (the preset or pre-meal target disappeared). That `requestId` is stored as `error`, so a replay does not try again. A new attempt needs a new `requestId`. `ok` means the override was applied, except when `reason` is `testMode`.
+
+| `reason` | `status` | When |
+|---|---|---|
+| `testMode` | `ok` | No-dose test mode is on. Validation passed. Settings were not changed. |
+| `stale` | `rejected` | `timestamp` is more than 2 minutes behind the phone. |
+| `future` | `rejected` | `timestamp` is more than 5 seconds ahead of the phone. |
+| `malformed` | `rejected` | Not a dictionary, missing `v`, `cmd`, `requestId`, or `timestamp`, or a present id is not a UUID. |
+| `unknownCommand` | `rejected` | `cmd` is not one of the four override commands and not an explicitly unsupported carb/bolus name. |
+| `unsupported` | `rejected` | Carb, bolus, or recommend. Capability for that action is false. |
+| `unsupportedVersion` | `rejected` | `v` is present and is not `1`. |
+| `missingPreset` | `rejected` | `preset.start` without `presetId`. |
+| `unknownPreset` | `rejected` | `presetId` is a UUID and it is not in `LoopSettings.overridePresets`. |
+| `preMealUnavailable` | `rejected` | `preMeal.start` and no pre-meal target is stored. |
+| `durationInvalid` | `rejected` | `durationSeconds` is missing a usable number, is not finite, or is not greater than 0. Also a stored preset duration that is not positive. |
+| `durationTooLong` | `rejected` | Finite duration is greater than 24 hours. |
+| `customTarget` | `rejected` | The plist contains `targetLowerMgdl`, `targetUpperMgdl`, `targetRange`, `target`, `insulinNeedsScaleFactor`, or `symbol`. |
+| `internal` | `error` | Validation succeeded and applying it through Loop's settings did not. |
+
+Every accepted write is logged in Loop's diagnostic log under the `PixelWatchDataManager` category, with the command name, request id, status, reason, duplicate flag, and test-mode flag. Structural ATT failures are logged too. They have no ack.
+
+### No-dose test mode
+
+Boolean UserDefaults key `com.loopkit.Loop.PixelWatchCommandTestMode`. There is no settings screen for it. When the key is true, Loop still checks the command and still sends an ack, but a command that would have been `ok` is `ok` with reason `testMode` and Loop does not call the override APIs. Rejections are still rejections. The key is read on every command. Default is false.
+
+Request ids are stored as JSON under `com.loopkit.Loop.PixelWatchCommandReceipts` for the 24 hour dedupe window.
+
+### Example command
+
+`preMeal.start` for the default hour, as a logical plist. On the wire, `timestamp` is a binary-plist date.
+
+```json
+{
+  "v": 1,
+  "cmd": "preMeal.start",
+  "requestId": "8B1E6C2A-4D5F-4A1B-9C3E-0F7A6B5C4D3E",
+  "timestamp": "2026-10-26T03:00:00Z"
+}
+```
+
+Ack, then the watch should expect a snapshot with `preMeal.active` true:
+
+```json
+{
+  "v": 1,
+  "ack": {
+    "requestId": "8B1E6C2A-4D5F-4A1B-9C3E-0F7A6B5C4D3E",
+    "status": "ok"
+  }
+}
+```
+
+`preset.start` for a saved preset, keeping that preset's own duration:
+
+```json
+{
+  "v": 1,
+  "cmd": "preset.start",
+  "requestId": "91C04E77-2B18-4F0A-8D55-6A0E1F2B3C4D",
+  "timestamp": "2026-10-26T03:00:01Z",
+  "presetId": "2F1C0A7E-6B4D-4E2A-9C11-8A0B1C2D3E4F"
+}
+```
+
 ## What this payload does not do
 
-- No write characteristic, no command names, no request ids.
-- Nothing in this path calls `enactBolus`, `addCarbEntry`, or `mutateSettings`.
-- The watch must not compute a dose from these fields. `recommendedUnits` / `rbo` is Loop's number.
-- Capabilities are all false until a later change both accepts a command and says so here.
+- No carb entry and no bolus. `cap.carbs` and `cap.bolus` stay false, and those command names are rejected.
+- The watch never sends a custom glucose target or an insulin-needs factor. Presets are only presets that already exist on the phone.
+- Nothing on this path calls `enactBolus` or `addCarbEntry`.
+- The watch must not compute a dose from the snapshot. `recommendedUnits` / `rbo` is Loop's number.
+- Loop does not retry a write, an ack, or an override.

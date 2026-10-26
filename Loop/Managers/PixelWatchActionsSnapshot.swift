@@ -14,7 +14,8 @@ import LoopKit
 ///
 /// The envelope version stays `1` so a watch that already reads `v`, `ctx`, and `hg`
 /// keeps working. New data lives under `act` and is versioned by `act.v`.
-/// There is no command, write characteristic, or dosing path in this type.
+/// This value describes state only. Override commands are handled separately
+/// and cannot set a custom target from the watch.
 /// Wire format: `docs/pixel-watch-protocol.md`.
 struct PixelWatchActionsSnapshot {
     static let envelopeVersion = 1
@@ -153,11 +154,11 @@ struct PixelWatchActionsSnapshot {
         return raw
     }
 
-    /// Commands the phone will accept. All false: this build has no write characteristic.
+    /// Commands this phone will accept. Carb and bolus writes are still refused.
     private static func capabilityDictionary() -> [String: Bool] {
         return [
-            "preMeal": false,
-            "workout": false,
+            "preMeal": true,
+            "workout": true,
             "carbs": false,
             "bolus": false
         ]

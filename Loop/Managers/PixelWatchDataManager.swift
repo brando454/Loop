@@ -12,23 +12,31 @@ import LoopCore
 import LoopKit
 
 /// Streams the same status payload the Apple Watch receives to a BLE-connected
-/// Wear OS watch. The phone publishes one GATT service; the watch (already
-/// bonded to the iPhone for ANCS) subscribes to the context characteristic and
-/// receives a binary-plist envelope, chunked to fit notification payloads:
+/// Wear OS watch, plus a read-only actions snapshot (`act`) the watch can use
+/// to draw Pre-Meal, Workout, Carbs, and Bolus screens. The phone publishes one
+/// GATT service; the watch (already bonded to the iPhone for ANCS) subscribes
+/// to the context characteristic and receives a binary-plist envelope, chunked
+/// to fit notification payloads:
 ///
 ///     byte 0: flags (bit 0 = first chunk, bit 1 = last chunk)
 ///     byte 1: sequence number within the message
 ///     rest:   payload
 ///
-/// The envelope is `["v": 1, "ctx": WatchContext.rawValue, "hg": [[epochSeconds, mgdl]]]`,
-/// reusing the exact WatchContext wire format WatchConnectivity transmits, plus
-/// recent glucose history for the chart (which the Apple Watch fetches through
-/// backfill requests instead).
+/// Envelope version stays `1`: `v`, `ctx` (WatchContext, minus `cgmManagerState`),
+/// and `hg` (three hours of glucose) are unchanged. Actions data is an extra key.
+/// This manager does not accept commands. There is no write characteristic.
+/// Schema: `docs/pixel-watch-protocol.md`.
 final class PixelWatchDataManager: NSObject {
 
     /// Must match the LOOP_* UUIDs on the watch side (watch-iphone-bridge).
     static let serviceUUID = CBUUID(string: "354E12EF-6EA4-4255-B054-9D2A113E2C8D")
     static let contextUUID = CBUUID(string: "219E7627-1F0C-4D0C-951F-FDC44514B868")
+
+    /// Notify-only and encryption-required. An unbonded peer cannot subscribe, and nobody can write.
+    static let contextProperties: CBCharacteristicProperties = [.notifyEncryptionRequired]
+
+    /// No read and no write permission. The value is delivered only as notifications.
+    static let contextPermissions: CBAttributePermissions = []
 
     private unowned let deviceManager: DeviceDataManager
     private unowned let watchManager: WatchDataManager
@@ -41,6 +49,9 @@ final class PixelWatchDataManager: NSObject {
 
     /// Chunks of the in-flight message; replaced whenever a newer context arrives.
     private var pendingChunks: [Data] = []
+
+    /// Avoid logging the same oversized-payload fallback on every loop update.
+    private var loggedOversizedSnapshot = false
 
     private let historicalGlucoseInterval = TimeInterval(hours: 3)
 
@@ -72,79 +83,91 @@ final class PixelWatchDataManager: NSObject {
         }
 
         watchManager.createWatchContext { context in
-            self.makeEnvelope(for: context) { envelope in
+            let settings = self.deviceManager.loopManager.settings
+            let pumpDataDate = self.deviceManager.doseStore.lastAddedPumpData
+            let defaultCarbAbsorption = self.deviceManager.carbStore.defaultAbsorptionTimes.medium
+            self.makeSnapshot(
+                for: context,
+                settings: settings,
+                pumpDataDate: pumpDataDate,
+                defaultCarbAbsorption: defaultCarbAbsorption
+            ) { snapshot in
                 self.queue.async {
-                    self.enqueue(envelope)
+                    self.enqueue(snapshot)
                 }
             }
         }
     }
 
-    private func makeEnvelope(for context: WatchContext, completion: @escaping (Data?) -> Void) {
+    private func makeSnapshot(
+        for context: WatchContext,
+        settings: LoopSettings,
+        pumpDataDate: Date,
+        defaultCarbAbsorption: TimeInterval,
+        completion: @escaping (PixelWatchActionsSnapshot) -> Void
+    ) {
         let start = Date(timeIntervalSinceNow: -historicalGlucoseInterval)
         deviceManager.glucoseStore.getGlucoseSamples(start: start, end: nil) { result in
-            var history: [[Double]] = []
+            let history: [[Double]]
             if case .success(let samples) = result {
                 history = samples.map {
                     [$0.startDate.timeIntervalSince1970, $0.quantity.doubleValue(for: .milligramsPerDeciliter)]
                 }
+            } else {
+                history = []
             }
 
-            var rawContext = context.rawValue
-            // Pump/CGM manager internals aren't needed for display
-            rawContext["cgmManagerState"] = nil
-
-            let envelope: [String: Any] = [
-                "v": 1,
-                "ctx": rawContext,
-                "hg": history
-            ]
-
-            do {
-                completion(try PropertyListSerialization.data(fromPropertyList: envelope, format: .binary, options: 0))
-            } catch {
-                self.log.error("Could not serialize context envelope: %{public}@", String(describing: error))
-                completion(nil)
-            }
+            completion(PixelWatchActionsSnapshot.make(
+                context: context,
+                glucoseHistory: history,
+                settings: settings,
+                pumpDataDate: pumpDataDate,
+                defaultCarbAbsorption: defaultCarbAbsorption
+            ))
         }
     }
 
     /// Runs on `queue`.
-    private func enqueue(_ envelope: Data?) {
-        guard let envelope = envelope,
-              let characteristic = contextCharacteristic,
+    private func enqueue(_ snapshot: PixelWatchActionsSnapshot) {
+        guard let characteristic = contextCharacteristic,
               let centrals = characteristic.subscribedCentrals,
+              !centrals.isEmpty,
               let maximumUpdateValueLength = centrals.map({ $0.maximumUpdateValueLength }).min()
         else {
             return
         }
-
-        let headerSize = 2
-        let chunkSize = max(20 - headerSize, maximumUpdateValueLength - headerSize)
-
-        var chunks: [Data] = []
-        var offset = 0
-        var sequence: UInt8 = 0
-        while offset < envelope.count {
-            let end = min(offset + chunkSize, envelope.count)
-            var flags: UInt8 = 0
-            if offset == 0 {
-                flags |= 0x01
-            }
-            if end == envelope.count {
-                flags |= 0x02
-            }
-            var chunk = Data([flags, sequence])
-            chunk.append(envelope.subdata(in: offset..<end))
-            chunks.append(chunk)
-            sequence = sequence &+ 1
-            offset = end
+        guard let payload = snapshot.framedPayload(maximumUpdateValueLength: maximumUpdateValueLength) else {
+            log.error("Could not serialize context envelope")
+            return
         }
+
+        notePayloadSize(payload)
 
         // The watch resets its reassembly buffer on every first-flagged chunk,
         // so replacing an unfinished message with a newer one is safe.
-        pendingChunks = chunks
+        pendingChunks = payload.chunks
         drainChunks()
+    }
+
+    /// Runs on `queue`.
+    private func notePayloadSize(_ payload: PixelWatchFramedPayload) {
+        let oversized = payload.kind != .full || payload.chunks.count > PixelWatchNotificationFraming.maxChunks
+        guard oversized else {
+            loggedOversizedSnapshot = false
+            return
+        }
+        guard !loggedOversizedSnapshot else {
+            return
+        }
+        loggedOversizedSnapshot = true
+        switch payload.kind {
+        case .full:
+            log.error("Pixel Watch context envelope exceeds the BLE chunk budget")
+        case .presetsOmitted:
+            log.default("Pixel Watch actions snapshot omitted presets to fit the BLE notification budget")
+        case .actionsOmitted:
+            log.error("Pixel Watch actions snapshot omitted to fit the BLE notification budget")
+        }
     }
 
     /// Runs on `queue`.
@@ -171,9 +194,9 @@ extension PixelWatchDataManager: CBPeripheralManagerDelegate {
                 // Notify-only, encryption required: only the bonded watch can subscribe
                 let characteristic = CBMutableCharacteristic(
                     type: Self.contextUUID,
-                    properties: [.notifyEncryptionRequired],
+                    properties: Self.contextProperties,
                     value: nil,
-                    permissions: []
+                    permissions: Self.contextPermissions
                 )
                 let service = CBMutableService(type: Self.serviceUUID, primary: true)
                 service.characteristics = [characteristic]

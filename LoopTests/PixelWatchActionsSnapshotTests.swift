@@ -329,6 +329,33 @@ class PixelWatchActionsSnapshotTests: XCTestCase {
         XCTAssertEqual([UInt8](single[0].prefix(2)), [0x03, 0])
     }
 
+    func testNonFiniteNumbersDoNotBlockTheBaseSnapshot() throws {
+        let context = sampleContext(recommendedBolus: .nan)
+        var settings = LoopSettings()
+        settings.overridePresets = [
+            TemporaryScheduleOverridePreset(
+                symbol: "🏃",
+                name: "Exercise",
+                settings: TemporaryScheduleOverrideSettings(targetRange: nil, insulinNeedsScaleFactor: .infinity),
+                duration: .finite(60 * 60)
+            )
+        ]
+        let snapshot = PixelWatchActionsSnapshot.make(
+            context: context,
+            glucoseHistory: [[1_700_000_000, .nan], [1_700_000_100, 120]],
+            settings: settings,
+            pumpDataDate: pumpDataDate,
+            defaultCarbAbsorption: 3 * 60 * 60,
+            now: now
+        )
+        let payload = try XCTUnwrap(snapshot.framedPayload(maximumUpdateValueLength: 512))
+        XCTAssertFalse(payload.chunks.isEmpty)
+        let decoded = try plist(from: payload)
+        XCTAssertEqual(intValue(decoded["v"]), 1)
+        XCTAssertNotNil(decoded["ctx"])
+        XCTAssertNotNil(decoded["hg"])
+    }
+
     func testContextCharacteristicStaysNotifyOnly() {
         let writable: CBCharacteristicProperties = [.write, .writeWithoutResponse, .authenticatedSignedWrites]
         XCTAssertEqual(PixelWatchDataManager.contextProperties, [.notifyEncryptionRequired])

@@ -11,7 +11,7 @@ One service. Two characteristics. Link encryption is the existing iPhone bond (t
 | Service | `354E12EF-6EA4-4255-B054-9D2A113E2C8D` | same service |
 | Characteristic | `219E7627-1F0C-4D0C-951F-FDC44514B868` | `C5D8A1E4-7B32-4F9A-8E16-0A4D5C7B9E21` |
 | Properties | Notify, encryption required | Write, write encryption required |
-| Permissions | None. Not readable and not writable. | Write encryption required only. There is no unencrypted write permission. |
+| Permissions | None. Not readable and not writable. | Writeable and write-encryption-required. Core Bluetooth rejects the whole service if the writeable bit is missing. An unencrypted write is still rejected. |
 | Direction | Phone to watch | Watch to phone |
 
 A peer that is not bonded cannot subscribe and cannot write. Core Bluetooth rejects an unencrypted write before Loop sees the bytes.

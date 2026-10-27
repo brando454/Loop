@@ -40,8 +40,10 @@ final class PixelWatchDataManager: NSObject {
     /// Write With Response, and only on an encrypted link. The bond is the same one the notify path uses.
     static let commandProperties: CBCharacteristicProperties = [.write, .writeEncryptionRequired]
 
-    /// Encryption required, with no unencrypted write permission. The stack rejects a write that is not authenticated.
-    static let commandPermissions: CBAttributePermissions = [.writeEncryptionRequired]
+    /// `writeable` is required for Core Bluetooth to accept the characteristic.
+    /// `writeEncryptionRequired` is what rejects an unencrypted write. Omitting `writeable`
+    /// makes `didAdd` fail and takes the notify characteristic down with the service.
+    static let commandPermissions: CBAttributePermissions = [.writeable, .writeEncryptionRequired]
 
     private unowned let deviceManager: DeviceDataManager
     private unowned let watchManager: WatchDataManager
@@ -52,14 +54,22 @@ final class PixelWatchDataManager: NSObject {
     private var peripheralManager: CBPeripheralManager!
     private var contextCharacteristic: CBMutableCharacteristic?
     private var commandCharacteristic: CBMutableCharacteristic?
+    /// Service handed back by state restoration. Kept so we can remove it even if `peripheral.services` is still empty.
+    private var restoredService: CBService?
     private var servicesPendingRemoval = 0
+    private var republishAfterRemoval = false
+    /// The service currently passed to `add`. Characteristics are adopted only after `didAdd` succeeds.
+    private var pendingPublish: PendingPublish?
+    private var didFallBackToContextOnly = false
 
     /// Ack chunks are always drained before snapshot chunks. A new ack drops any snapshot bytes still waiting.
     private var pendingAckChunks: [Data] = []
     private var pendingSnapshotChunks: [Data] = []
 
-    /// Bumped each time a snapshot is requested. An older fetch must not overwrite a newer one.
-    private var snapshotGeneration: UInt64 = 0
+    /// One snapshot build at a time. A newer request is remembered and runs after this one is sent,
+    /// so a burst of loop updates cannot discard every payload before the watch sees one.
+    private var snapshotBuildInFlight = false
+    private var snapshotBuildQueued = false
 
     private var processor = PixelWatchCommandProcessor(receipts: [], testMode: false)
 
@@ -110,8 +120,11 @@ final class PixelWatchDataManager: NSObject {
             return
         }
 
-        snapshotGeneration &+= 1
-        let generation = snapshotGeneration
+        if snapshotBuildInFlight {
+            snapshotBuildQueued = true
+            return
+        }
+        snapshotBuildInFlight = true
 
         watchManager.createWatchContext { context in
             let settings = self.deviceManager.loopManager.settings
@@ -124,10 +137,12 @@ final class PixelWatchDataManager: NSObject {
                 defaultCarbAbsorption: defaultCarbAbsorption
             ) { snapshot in
                 self.queue.async {
-                    guard generation == self.snapshotGeneration else {
-                        return
-                    }
+                    self.snapshotBuildInFlight = false
                     self.enqueue(snapshot)
+                    if self.snapshotBuildQueued {
+                        self.snapshotBuildQueued = false
+                        self.startSnapshotOnQueue()
+                    }
                 }
             }
         }
@@ -303,48 +318,86 @@ final class PixelWatchDataManager: NSObject {
         )
     }
 
+    /// Runs on `queue`. A characteristic cannot be added to a service that is already published.
+    /// The working notify characteristic stays in place until a replacement `didAdd` succeeds.
     private func ensureService(on peripheral: CBPeripheralManager) {
-        if contextCharacteristic != nil && commandCharacteristic != nil {
-            return
-        }
-
         let published = peripheral.services?.filter { $0.uuid == Self.serviceUUID } ?? []
-        let restoredIncomplete = contextCharacteristic != nil || commandCharacteristic != nil || !published.isEmpty
-        guard restoredIncomplete else {
-            addService(to: peripheral)
+        guard let service = published.first ?? restoredService else {
+            addService(includingCommand: true, to: peripheral)
             return
         }
 
-        log.default("Pixel Watch service is missing the command characteristic; republishing. The watch must reconnect.")
-        contextCharacteristic = nil
-        commandCharacteristic = nil
-        guard !published.isEmpty else {
-            addService(to: peripheral)
+        adopt(service)
+        if !published.isEmpty && contextCharacteristic != nil && Self.commandCharacteristicIsUsable(on: service) {
+            log.default("Pixel Watch service already published with context and command characteristics")
             return
         }
-        servicesPendingRemoval = published.count
-        published.forEach { peripheral.remove($0) }
+
+        let toRemove = published.isEmpty ? [service] : published
+        log.default("Pixel Watch service is missing a usable command characteristic; removing it before republish. The watch must reconnect.")
+        republishAfterRemoval = true
+        servicesPendingRemoval = toRemove.count
+        toRemove.forEach { peripheral.remove($0) }
     }
 
-    private func addService(to peripheral: CBPeripheralManager) {
+    /// A command characteristic Core Bluetooth will keep published. Missing `writeable` is the PR #2 bug:
+    /// the service is rejected, or the watch cannot use the connection.
+    private static func commandCharacteristicIsUsable(on service: CBService) -> Bool {
+        guard let command = service.characteristics?.first(where: { $0.uuid == Self.commandUUID }) as? CBMutableCharacteristic else {
+            return false
+        }
+        let properties = command.properties
+        guard properties.contains(.write), properties.contains(.writeEncryptionRequired) else {
+            return false
+        }
+        let permissions = command.permissions
+        if permissions.isEmpty {
+            // Some restores do not report permissions. Properties already match, so do not republish every launch.
+            return true
+        }
+        return permissions.contains(.writeable) && permissions.contains(.writeEncryptionRequired)
+    }
+
+    private func adopt(_ service: CBService) {
+        if let context = service.characteristics?.first(where: { $0.uuid == Self.contextUUID }) as? CBMutableCharacteristic {
+            contextCharacteristic = context
+        }
+        if let command = service.characteristics?.first(where: { $0.uuid == Self.commandUUID }) as? CBMutableCharacteristic {
+            commandCharacteristic = command
+        }
+    }
+
+    /// Builds a new service. Does not replace `contextCharacteristic` until Core Bluetooth accepts it.
+    private func addService(includingCommand: Bool, to peripheral: CBPeripheralManager) {
         let context = CBMutableCharacteristic(
             type: Self.contextUUID,
             properties: Self.contextProperties,
             value: nil,
             permissions: Self.contextPermissions
         )
-        let command = CBMutableCharacteristic(
-            type: Self.commandUUID,
-            properties: Self.commandProperties,
-            value: nil,
-            permissions: Self.commandPermissions
-        )
+        var characteristics = [context]
+        var command: CBMutableCharacteristic?
+        if includingCommand {
+            let writable = CBMutableCharacteristic(
+                type: Self.commandUUID,
+                properties: Self.commandProperties,
+                value: nil,
+                permissions: Self.commandPermissions
+            )
+            command = writable
+            characteristics.append(writable)
+        }
         let service = CBMutableService(type: Self.serviceUUID, primary: true)
-        service.characteristics = [context, command]
-        contextCharacteristic = context
-        commandCharacteristic = command
+        service.characteristics = characteristics
+        pendingPublish = PendingPublish(service: service, context: context, command: command)
         peripheral.add(service)
     }
+}
+
+private struct PendingPublish {
+    var service: CBMutableService
+    var context: CBMutableCharacteristic
+    var command: CBMutableCharacteristic?
 }
 
 extension PixelWatchDataManager: CBPeripheralManagerDelegate {
@@ -358,19 +411,55 @@ extension PixelWatchDataManager: CBPeripheralManagerDelegate {
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
-        guard let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService],
-              let service = services.first(where: { $0.uuid == Self.serviceUUID })
-        else {
+        guard let service = Self.restoredServices(from: dict).first(where: { $0.uuid == Self.serviceUUID }) else {
             return
         }
-        contextCharacteristic = service.characteristics?.first(where: { $0.uuid == Self.contextUUID }) as? CBMutableCharacteristic
-        commandCharacteristic = service.characteristics?.first(where: { $0.uuid == Self.commandUUID }) as? CBMutableCharacteristic
+        restoredService = service
+        adopt(service)
+        if commandCharacteristic == nil {
+            log.default("Restored Pixel Watch service has no command characteristic")
+        }
+    }
+
+    private static func restoredServices(from dict: [String: Any]) -> [CBService] {
+        if let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService] {
+            return services
+        }
+        if let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBService] {
+            return services
+        }
+        return []
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        let pending = pendingPublish
+        pendingPublish = nil
+        guard service.uuid == Self.serviceUUID else {
+            pendingPublish = pending
+            return
+        }
         if let error = error {
             log.error("Could not publish Loop context service: %{public}@", String(describing: error))
+            let failedWithCommand = pending?.command != nil
+            if failedWithCommand && !didFallBackToContextOnly {
+                didFallBackToContextOnly = true
+                log.error("Publishing the Pixel Watch service without the command characteristic so snapshots can continue")
+                addService(includingCommand: false, to: peripheral)
+            }
+            return
         }
+
+        if let pending = pending {
+            contextCharacteristic = pending.context
+            commandCharacteristic = pending.command
+        }
+        restoredService = nil
+        if commandCharacteristic != nil {
+            log.default("Published Pixel Watch service with context and command characteristics")
+        } else {
+            log.default("Published Pixel Watch service with the context characteristic only")
+        }
+        sendContextIfNeeded()
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didRemove service: CBService, error: Error?) {
@@ -380,16 +469,25 @@ extension PixelWatchDataManager: CBPeripheralManagerDelegate {
         servicesPendingRemoval -= 1
         if let error = error {
             log.error("Could not remove the restored Pixel Watch service: %{public}@", String(describing: error))
+        } else {
+            // Removal succeeded, so the previous characteristic is no longer published.
+            contextCharacteristic = nil
+            commandCharacteristic = nil
+            restoredService = nil
         }
-        guard servicesPendingRemoval == 0 else {
+        guard servicesPendingRemoval == 0, republishAfterRemoval else {
             return
         }
-        addService(to: peripheral)
+        republishAfterRemoval = false
+        addService(includingCommand: true, to: peripheral)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
         guard characteristic.uuid == Self.contextUUID else {
             return
+        }
+        if let mutable = characteristic as? CBMutableCharacteristic {
+            contextCharacteristic = mutable
         }
         log.default("Watch subscribed to Loop context; sending current state")
         sendContextIfNeeded()

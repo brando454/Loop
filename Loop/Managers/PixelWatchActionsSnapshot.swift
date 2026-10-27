@@ -90,7 +90,7 @@ struct PixelWatchActionsSnapshot {
 
         var smallest: PixelWatchFramedPayload?
         for (kind, plist) in candidates {
-            guard let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0) else {
+            guard let data = binaryPlist(plist) else {
                 continue
             }
             let chunks = PixelWatchNotificationFraming.chunks(of: data, maximumUpdateValueLength: maximumUpdateValueLength)
@@ -101,6 +101,48 @@ struct PixelWatchActionsSnapshot {
             }
         }
         return smallest
+    }
+
+    /// Serialization of `act` must not drop the base `v`/`ctx`/`hg` snapshot.
+    /// A non-finite number makes `PropertyListSerialization` throw; strip those and try again,
+    /// then let the caller move on to the legacy envelope.
+    private static func binaryPlist(_ plist: [String: Any]) -> Data? {
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0) {
+            return data
+        }
+        guard let cleaned = stripNonFinite(plist) as? [String: Any] else {
+            return nil
+        }
+        return try? PropertyListSerialization.data(fromPropertyList: cleaned, format: .binary, options: 0)
+    }
+
+    private static func stripNonFinite(_ value: Any) -> Any? {
+        if let dictionary = value as? [String: Any] {
+            var cleaned: [String: Any] = [:]
+            for (key, item) in dictionary {
+                if let safe = stripNonFinite(item) {
+                    cleaned[key] = safe
+                }
+            }
+            return cleaned
+        }
+        if let rows = value as? [[Double]] {
+            return rows.filter { row in row.allSatisfy(\.isFinite) }
+        }
+        if let numbers = value as? [Double] {
+            let finite = numbers.filter(\.isFinite)
+            return finite.isEmpty ? nil : finite
+        }
+        if let items = value as? [Any] {
+            return items.compactMap { stripNonFinite($0) }
+        }
+        if let number = value as? Double {
+            return number.isFinite ? number : nil
+        }
+        if let number = value as? Float {
+            return number.isFinite ? Double(number) : nil
+        }
+        return value
     }
 
     private static func envelope(
